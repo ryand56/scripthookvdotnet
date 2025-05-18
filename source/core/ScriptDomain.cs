@@ -77,6 +77,74 @@ namespace SHVDN
             }
         }
 
+        public class SafeLock : IDisposable
+        {
+            private ReaderWriterLockSlim _lock = new ReaderWriterLockSlim();
+            private bool _disposed;
+
+            public bool TryRead(Action action)
+            {
+                if (_disposed || _lock == null)
+                    return false;
+
+                try
+                {
+                    _lock.EnterReadLock();
+                    action?.Invoke();
+                    return true;
+                }
+                catch (ObjectDisposedException)
+                {
+                    return false;
+                }
+                catch (Exception)
+                {
+                    throw;
+                }
+                finally
+                {
+                    if (_lock.IsReadLockHeld)
+                        _lock.ExitReadLock();
+                }
+            }
+
+            public bool TryWrite(Action action)
+            {
+                if (_disposed || _lock == null)
+                    return false;
+
+                try
+                {
+                    _lock.EnterWriteLock();
+                    action?.Invoke();
+                    return true;
+                }
+                catch (ObjectDisposedException)
+                {
+                    return false;
+                }
+                catch (Exception)
+                {
+                    throw;
+                }
+                finally
+                {
+                    if (_lock.IsWriteLockHeld)
+                        _lock.ExitWriteLock();
+                }
+            }
+
+            public void Dispose()
+            {
+                if (!_disposed)
+                {
+                    _lock?.Dispose();
+                    _lock = null;
+                    _disposed = true;
+                }
+            }
+        }
+
         // Debugger.IsAttached does not detect a Visual Studio debugger
         [SuppressUnmanagedCodeSecurity]
         [DllImport("Kernel32.dll")]
@@ -100,7 +168,7 @@ namespace SHVDN
         // `Dispose` won't be called in this instance because it may be too difficult to call correctly due to how
         // separate `AppDomain`s have different static variables, but it's acceptable since `ReaderWriterLockSlim` uses
         // `EventWaitHandle`, which uses `SafeHandle`.
-        private static readonly ReaderWriterLockSlim s_currentDomainPropertyLock = new();
+        private static readonly SafeLock s_currentDomainPropertyLock = new();
 
         private readonly int _executingThreadId = Thread.CurrentThread.ManagedThreadId;
         private Script _executingScript = null;
@@ -130,13 +198,13 @@ namespace SHVDN
         // Since `ConcurrentQueue` doesn't have `Clear` method in .NET Framework where the head and tail will be set
         // to a new segment instance, we read `_pinnedStrings` sequentially to dispose pinned strings.
         private readonly object _pinnedStrListLock = new();
-        private readonly ReaderWriterLockSlim _tlsVariablesLock = new();
+        private readonly SafeLock _tlsVariablesLock = new();
 
         // These locks are used to avoid race conditions, but the code looks so terrible with a lot of lock blocks.
         // If there is a better way to avoid using them a lot by refactoring the code especially on data structures,
         // it would be much appreciated.
         private readonly object _lockForFieldsThatFrequentlyWritten = new();
-        private readonly ReaderWriterLockSlim _rwLock = new();
+        private readonly SafeLock _rwLock = new();
 
         /// <summary>
         /// The byte array that contains "CELL_EMAIL_BCON", which is used when SHVDN logs unhandled exceptions
@@ -150,32 +218,24 @@ namespace SHVDN
         internal unsafe void InitTlsStuffForTlsContextSwitch(IntPtr getTlsContextFunc, IntPtr setTlsContextFunc,
             IntPtr tlsAddr, uint threadId)
         {
-            _tlsVariablesLock.EnterWriteLock();
-            try
-            {
+            _tlsVariablesLock?.TryWrite(() => {
                 _getTlsContext = (delegate* unmanaged[Cdecl]<IntPtr>)getTlsContextFunc;
                 _setTlsContext = (delegate* unmanaged[Cdecl]<IntPtr, void>)setTlsContextFunc;
                 _tlsContextOfMainThread = tlsAddr;
                 _gameMainThreadIdUnmanaged = threadId;
                 _areTlsVarsInitialized = true;
-            }
-            finally
-            {
-                _tlsVariablesLock.ExitWriteLock();
-            }
+            });
         }
 
         internal bool IsTlsStuffInitialized()
         {
-            _tlsVariablesLock.EnterReadLock();
-            try
-            {
-                return _areTlsVarsInitialized;
-            }
-            finally
-            {
-                _tlsVariablesLock.ExitReadLock();
-            }
+            bool ret = false;
+
+            _tlsVariablesLock?.TryRead(() => {
+                ret = _areTlsVarsInitialized;
+            });
+
+            return ret;
         }
 
         internal void InitNativeNemoryMembers()
@@ -212,27 +272,19 @@ namespace SHVDN
         {
             get
             {
-                s_currentDomainPropertyLock.EnterReadLock();
-                try
-                {
-                    return s_currentDomain;
-                }
-                finally
-                {
-                    s_currentDomainPropertyLock.ExitReadLock();
-                }
+                ScriptDomain ret = null;
+
+                s_currentDomainPropertyLock?.TryRead(() => {
+                    ret = s_currentDomain;
+                });
+
+                return ret;
             }
             set
             {
-                s_currentDomainPropertyLock.EnterWriteLock();
-                try
-                {
+                s_currentDomainPropertyLock?.TryWrite(() => {
                     s_currentDomain = value;
-                }
-                finally
-                {
-                    s_currentDomainPropertyLock.ExitWriteLock();
-                }
+                });
             }
         }
 
@@ -243,15 +295,13 @@ namespace SHVDN
         {
             get
             {
-                _rwLock.EnterReadLock();
-                try
-                {
-                    return _runningScripts.ToArray();
-                }
-                finally
-                {
-                    _rwLock.ExitReadLock();
-                }
+                Script[] ret = null;
+
+                _rwLock?.TryRead(() => {
+                    ret = _runningScripts.ToArray();
+                });
+
+                return ret;
             }
         }
 
@@ -786,21 +836,16 @@ namespace SHVDN
                     }
 
                     // The script is likely to add to script types list, so intentionally use write lock here
-                    _rwLock.EnterWriteLock();
-                    try
-                    {
-                        if (_scriptTypes.TryGetValue(key, out ScriptTypeInfo scriptTypeInfo))
+                    _rwLock?.TryWrite(() => {
+                        if (!_scriptTypes.TryGetValue(key, out ScriptTypeInfo scriptTypeInfo))
+                        {
+                            _scriptTypes.Add(key, new ScriptTypeInfo(asmInfo, type, targetApiVersion));
+                        }
+                        else
                         {
                             Log.Message(Log.Level.Warning, "The script name ", type.FullName, " already exists and was loaded from ", Path.GetFileName(scriptTypeInfo.AssemblyInfo.FileName), ". Ignoring occurrence loaded from ", Path.GetFileName(filename), ".");
-                            continue; // Skip types that were already added previously are ignored
                         }
-
-                        _scriptTypes.Add(key, new ScriptTypeInfo(asmInfo, type, targetApiVersion));
-                    }
-                    finally
-                    {
-                        _rwLock.ExitWriteLock();
-                    }
+                    });
                 }
 
                 return scriptTypeCount;
@@ -861,21 +906,16 @@ namespace SHVDN
                     }
 
                     // The script is likely to add to script types list, so intentionally use write lock here
-                    _rwLock.EnterWriteLock();
-                    try
-                    {
-                        if (_scriptTypes.TryGetValue(key, out ScriptTypeInfo scriptTypeInfo))
+                    _rwLock?.TryWrite(() => {
+                        if (!_scriptTypes.TryGetValue(key, out ScriptTypeInfo scriptTypeInfo))
+                        {
+                            _scriptTypes.Add(key, new ScriptTypeInfo(asmInfo, type, targetApiVersion));
+                        }
+                        else
                         {
                             Log.Message(Log.Level.Warning, "The script name ", type.FullName, " already exists and was loaded from ", Path.GetFileName(scriptTypeInfo.AssemblyInfo.FileName), ". Ignoring occurrence loaded from ", Path.GetFileName(filename), ".");
-                            continue; // Skip types that were already added previously are ignored
                         }
-
-                        _scriptTypes.Add(key, new ScriptTypeInfo(asmInfo, type, targetApiVersion));
-                    }
-                    finally
-                    {
-                        _rwLock.ExitWriteLock();
-                    }
+                    });
                 }
             }
             catch (ReflectionTypeLoadException ex)
@@ -1155,15 +1195,9 @@ namespace SHVDN
 
             script.NativeCallResetsTimeout = initOption.NativeCallResetsTimeout;
 
-            _rwLock.EnterWriteLock();
-            try
-            {
+            _rwLock?.TryWrite(() => {
                 _runningScripts.Add(script);
-            }
-            finally
-            {
-                _rwLock.ExitWriteLock();
-            }
+            });
 
             lock (_lockForFieldsThatFrequentlyWritten)
             {
@@ -1182,16 +1216,10 @@ namespace SHVDN
             int scriptTypesCount = 0;
             int runningScriptCount = 0;
 
-            _rwLock.EnterReadLock();
-            try
-            {
+            _rwLock?.TryRead(() => {
                 scriptTypesCount = _scriptTypes.Count;
                 runningScriptCount = _runningScripts.Count;
-            }
-            finally
-            {
-                _rwLock.ExitReadLock();
-            }
+            });
 
             if (scriptTypesCount != 0 || runningScriptCount != 0)
             {
@@ -1263,15 +1291,14 @@ namespace SHVDN
                 WarnOfScriptsUsingDeprecatedApi();
             }
 
+            List<ScriptTypeInfo> scriptTypesToInstantiate = new(_scriptTypes.Count);
+
             // Find candidates for instantiation.
             // Instantiate scripts after they were all loaded, so that dependencies are launched with the right ordering.
             // If the rw lock is used in the whole loop, a script will end up indirectly reading `RunningScripts`
             // where the same lock is used, causing a `LockRecursionException` without getting caught and
             // the whole process will crash.
-            _rwLock.EnterReadLock();
-            List<ScriptTypeInfo> scriptTypesToInstantiate = new(_scriptTypes.Count);
-            try
-            {
+            _rwLock?.TryRead(() => {
                 foreach (ScriptTypeInfo scriptTypeInfo in _scriptTypes.Values)
                 {
                     // Start the script unless script does not want a default instance or is abstract
@@ -1284,11 +1311,7 @@ namespace SHVDN
 
                     scriptTypesToInstantiate.Add(scriptTypeInfo);
                 }
-            }
-            finally
-            {
-                _rwLock.ExitReadLock();
-            }
+            });
             foreach (ScriptTypeInfo scriptTypeInfo in scriptTypesToInstantiate)
             {
                 ScriptInitOption initOpt = BuildScriptInitOptionFromScriptAttribute(scriptTypeInfo.Type,
@@ -1346,9 +1369,7 @@ namespace SHVDN
             // where the same lock is used, causing a `LockRecursionException` without getting caught and
             // the whole process will crash.
             List<Type> scriptTypesToInstantiate = new();
-            _rwLock.EnterWriteLock();
-            try
-            {
+            _rwLock?.TryWrite(() => {
                 foreach (Type type in _scriptTypes.Values.Where(x => x.AssemblyInfo.FileName == filename).Select(x => x.Type))
                 {
                     // Make sure there are no others instances of this script
@@ -1367,11 +1388,7 @@ namespace SHVDN
 
                     scriptTypesToInstantiate.Add(type);
                 }
-            }
-            finally
-            {
-                _rwLock.ExitWriteLock();
-            }
+            });
 
             foreach (Type type in scriptTypesToInstantiate)
             {
@@ -1383,9 +1400,7 @@ namespace SHVDN
         /// </summary>
         public void Abort()
         {
-            _rwLock.EnterWriteLock();
-            try
-            {
+            _rwLock?.TryWrite(() => {
                 foreach (Script script in _runningScripts)
                 {
                     script.Abort();
@@ -1397,11 +1412,7 @@ namespace SHVDN
 
                 _scriptTypes.Clear();
                 _runningScripts.Clear();
-            }
-            finally
-            {
-                _rwLock.ExitWriteLock();
-            }
+            });
         }
         /// <summary>
         /// Aborts all running scripts from the specified file.
@@ -1412,18 +1423,12 @@ namespace SHVDN
             filename = Path.GetFullPath(filename);
 
             // we are only interested in the running script list as a lock target in this method
-            _rwLock.EnterReadLock();
-            try
-            {
+            _rwLock?.TryRead(() => {
                 foreach (Script script in _runningScripts.Where(x => filename.Equals(x.Filename, StringComparison.OrdinalIgnoreCase)))
                 {
                     script.Abort();
                 }
-            }
-            finally
-            {
-                _rwLock.ExitReadLock();
-            }
+            });
         }
 
         private bool ResetTimeoutStopwatchOfExecutingScriptIfScriptWantsToResetWhenCallingANativeFunc()
@@ -1495,30 +1500,18 @@ namespace SHVDN
             // the entire block.
             unsafe
             {
-                uint gameMainThreadIdUnmanaged;
-                IntPtr tlsContextOfMainThread;
-                delegate* unmanaged[Cdecl]<IntPtr> getTlsContext;
-                delegate* unmanaged[Cdecl]<IntPtr, void> setTlsContext;
+                uint gameMainThreadIdUnmanaged = 0;
+                IntPtr tlsContextOfMainThread = IntPtr.Zero;
+                delegate* unmanaged[Cdecl]<IntPtr> getTlsContext = null;
+                delegate* unmanaged[Cdecl]<IntPtr, void> setTlsContext = null;
 
                 #region Read TLS variables with the Lock for Them and Store to Local Variables
-                _tlsVariablesLock.EnterReadLock();
-                try
-                {
+                _tlsVariablesLock?.TryRead(() => {
                     gameMainThreadIdUnmanaged = _gameMainThreadIdUnmanaged;
                     tlsContextOfMainThread = _tlsContextOfMainThread;
                     getTlsContext = _getTlsContext;
                     setTlsContext = _setTlsContext;
-                }
-                catch
-                {
-                    // We should abort the method if reading the TLS variables *should* fail, so we can see the error
-                    // in the log when it's predictable.
-                    throw;
-                }
-                finally
-                {
-                    _tlsVariablesLock.ExitReadLock();
-                }
+                });
                 #endregion
 
                 if (gameMainThreadIdUnmanaged == GetCurrentThreadId())
@@ -1598,15 +1591,9 @@ namespace SHVDN
         /// <param name="pause"><see langword="true" /> to pause or <see langword="false" /> to resume</param>
         public void PauseKeyEvents(bool pause)
         {
-            _rwLock.EnterWriteLock();
-            try
-            {
+            _rwLock?.TryWrite(() => {
                 _recordKeyboardEvents = !pause;
-            }
-            finally
-            {
-                _rwLock.ExitWriteLock();
-            }
+            });
         }
 
         /// <summary>
@@ -1624,15 +1611,9 @@ namespace SHVDN
                 // where the same lock is used, causing a `LockRecursionException` without getting caught and
                 // the whole process will crash.
                 Script script = null;
-                _rwLock.EnterReadLock();
-                try
-                {
+                _rwLock?.TryRead(() => {
                     script = _runningScripts[i];
-                }
-                finally
-                {
-                    _rwLock.ExitReadLock();
-                }
+                });
 
                 // Ignore terminated scripts
                 if (!script.IsRunning || script.IsPaused)
@@ -1715,15 +1696,9 @@ namespace SHVDN
         private int GetRunningScriptsCount()
         {
             int c = 0;
-            _rwLock.EnterReadLock();
-            try
-            {
+            _rwLock?.TryRead(() => {
                 c = _runningScripts.Count;
-            }
-            finally
-            {
-                _rwLock.ExitReadLock();
-            }
+            });
 
             return c;
         }
@@ -1744,15 +1719,9 @@ namespace SHVDN
             }
 
             bool recordKeyEvents = false;
-            _rwLock.EnterReadLock();
-            try
-            {
+            _rwLock?.TryRead(() => {
                 recordKeyEvents = _recordKeyboardEvents;
-            }
-            finally
-            {
-                _rwLock.ExitReadLock();
-            }
+            });
 
             if (!recordKeyEvents)
             {
@@ -1762,18 +1731,12 @@ namespace SHVDN
             var eventInfo = new Tuple<bool, KeyEventArgs>(status, e);
 
             // we are only interested in the running script list as a lock target
-            _rwLock.EnterReadLock();
-            try
-            {
+            _rwLock?.TryRead(() => {
                 foreach (Script script in _runningScripts)
                 {
                     script._keyboardEvents.Enqueue(eventInfo);
                 }
-            }
-            finally
-            {
-                _rwLock.ExitReadLock();
-            }
+            });
         }
 
         /// <summary>
@@ -1826,15 +1789,9 @@ namespace SHVDN
 
             // Return matching script in running script list if one is found
             Script script = null;
-            _rwLock.EnterReadLock();
-            try
-            {
+            _rwLock?.TryRead(() => {
                 script = _runningScripts.FirstOrDefault(x => x.ScriptInstance == scriptInstance);
-            }
-            finally
-            {
-                _rwLock.ExitReadLock();
-            }
+            });
 
             Script executingScript = null;
             lock (_lockForFieldsThatFrequentlyWritten)
@@ -1862,15 +1819,13 @@ namespace SHVDN
         }
         public string LookupScriptFilename(Type scriptType)
         {
-            _rwLock.EnterReadLock();
-            try
-            {
-                return _scriptTypes.Values.FirstOrDefault(x => x.Type == scriptType)?.AssemblyInfo.FileName ?? string.Empty;
-            }
-            finally
-            {
-                _rwLock.ExitReadLock();
-            }
+            string ret = string.Empty;
+
+            _rwLock?.TryRead(() => {
+                ret = _scriptTypes.Values.FirstOrDefault(x => x.Type == scriptType)?.AssemblyInfo.FileName ?? string.Empty;
+            });
+
+            return ret;
         }
 
         /// <summary>
